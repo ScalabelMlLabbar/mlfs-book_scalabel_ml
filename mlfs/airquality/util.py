@@ -288,13 +288,41 @@ def check_file_path(file_path):
         print(f"File successfully found at the path: {file_path}")
 
 def backfill_predictions_for_monitoring(weather_fg, air_quality_df, monitor_fg, model):
+    # Get the model's expected features
+    model_feature_names = model.get_booster().feature_names
+
+    # Read weather data
     features_df = weather_fg.read()
     features_df = features_df.sort_values(by=['date'], ascending=True)
     features_df = features_df.tail(10)
-    features_df['predicted_pm25'] = model.predict(features_df[['temperature_2m_mean', 'precipitation_sum', 'wind_speed_10m_max', 'wind_direction_10m_dominant']])
-    df = pd.merge(features_df, air_quality_df[['date','pm25','street','country']], on="date")
+
+    # Merge with air quality data to get lagged features if they exist
+    # Only select columns needed for prediction (not pm25, which is the target)
+    aq_cols = ['date']
+    if 'pm25_lag_1d' in air_quality_df.columns:
+        aq_cols.extend(['pm25_lag_1d', 'pm25_lag_2d', 'pm25_lag_3d'])
+
+    if len(aq_cols) > 1:  # If we have lagged features
+        aq_features = air_quality_df[aq_cols]
+        features_df = pd.merge(features_df, aq_features, on="date", how="left")
+
+    # Select only the features the model expects, in the correct order
+    prediction_features = features_df[model_feature_names]
+
+    # Make predictions
+    features_df['predicted_pm25'] = model.predict(prediction_features)
+
+    # Merge with air quality data for monitoring (now include pm25 for hindcast comparison)
+    df = pd.merge(features_df, air_quality_df[['date','pm25','street','country']], on="date", how="left")
     df['days_before_forecast_day'] = 1
-    hindcast_df = df
-    df = df.drop('pm25', axis=1)
+    hindcast_df = df.copy()
+
+    # Drop pm25 before inserting into monitoring feature group
+    columns_to_drop = ['pm25']
+    # Also drop lagged features if they exist, as they're not needed in monitoring FG
+    if 'pm25_lag_1d' in df.columns:
+        columns_to_drop.extend(['pm25_lag_1d', 'pm25_lag_2d', 'pm25_lag_3d'])
+
+    df = df.drop(columns=columns_to_drop, errors='ignore')
     monitor_fg.insert(df, write_options={"wait_for_job": True})
     return hindcast_df
